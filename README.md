@@ -141,6 +141,8 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
 
+Each tool accepts `skip_sync_check` (default `false`). Set it to `true` to bypass the bridge health check and use available stored data, which may be stale. Sending messages and downloading media still require a working bridge and WhatsApp connection.
+
 ### Media Handling Features
 
 The MCP server supports both sending and receiving various media types:

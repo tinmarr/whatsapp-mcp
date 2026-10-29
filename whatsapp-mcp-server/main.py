@@ -1,5 +1,6 @@
 from typing import List, Dict, Any, Optional
 from functools import wraps
+from inspect import signature
 import requests
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
@@ -22,8 +23,12 @@ mcp = FastMCP("whatsapp")
 
 def require_sync(function):
     """Prevent apparently current answers when the bridge reports a failure."""
+    function_signature = signature(function)
+
     @wraps(function)
     def checked(*args, **kwargs):
+        if function_signature.bind(*args, **kwargs).arguments.get("skip_sync_check", False):
+            return function(*args, **kwargs)
         try:
             response = requests.get("http://localhost:8080/api/status", timeout=3)
             response.raise_for_status()
@@ -31,19 +36,20 @@ def require_sync(function):
             if not isinstance(status, dict) or not isinstance(status.get("healthy"), bool) or not isinstance(status.get("reasons"), list):
                 raise ValueError("invalid status response")
         except (requests.RequestException, ValueError) as exc:
-            raise RuntimeError(f"WhatsApp sync status unavailable: {exc}. Start or update the bridge; local data may be stale.") from exc
+            raise RuntimeError(f"WhatsApp sync status unavailable: {exc}. Start or update the bridge; local data may be stale. Set skip_sync_check=true to proceed using available data.") from exc
         if not status["healthy"]:
             reasons = "; ".join(str(reason) for reason in status["reasons"]) or "Unknown sync failure"
-            raise RuntimeError(f"WhatsApp sync is not healthy: {reasons}. Local data may be stale; tell the user.")
+            raise RuntimeError(f"WhatsApp sync is not healthy: {reasons}. Local data may be stale; tell the user. Set skip_sync_check=true to proceed using available data.")
         return function(*args, **kwargs)
     return checked
 
 @mcp.tool()
 @require_sync
-def search_contacts(query: str) -> List[Dict[str, Any]]:
+def search_contacts(query: str, skip_sync_check: bool = False) -> List[Dict[str, Any]]:
     """Search WhatsApp contacts by name or phone number.
     
     Args:
+        skip_sync_check: Skip the sync health check; stored data may be stale (default False).
         query: Search term to match against contact names or phone numbers
     """
     contacts = whatsapp_search_contacts(query)
@@ -61,11 +67,13 @@ def list_messages(
     page: int = 0,
     include_context: bool = True,
     context_before: int = 1,
-    context_after: int = 1
+    context_after: int = 1,
+    skip_sync_check: bool = False
 ) -> List[Dict[str, Any]]:
     """Get WhatsApp messages matching specified criteria with optional context.
     
     Args:
+        skip_sync_check: Skip the sync health check; stored data may be stale (default False).
         after: Optional ISO-8601 formatted string to only return messages after this date
         before: Optional ISO-8601 formatted string to only return messages before this date
         sender_phone_number: Optional phone number to filter messages by sender
@@ -98,11 +106,13 @@ def list_chats(
     limit: int = 20,
     page: int = 0,
     include_last_message: bool = True,
-    sort_by: str = "last_active"
+    sort_by: str = "last_active",
+    skip_sync_check: bool = False
 ) -> List[Dict[str, Any]]:
     """Get WhatsApp chats matching specified criteria.
     
     Args:
+        skip_sync_check: Skip the sync health check; stored data may be stale (default False).
         query: Optional search term to filter chats by name or JID
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
@@ -120,10 +130,11 @@ def list_chats(
 
 @mcp.tool()
 @require_sync
-def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]:
+def get_chat(chat_jid: str, include_last_message: bool = True, skip_sync_check: bool = False) -> Dict[str, Any]:
     """Get WhatsApp chat metadata by JID.
     
     Args:
+        skip_sync_check: Skip the sync health check; stored data may be stale (default False).
         chat_jid: The JID of the chat to retrieve
         include_last_message: Whether to include the last message (default True)
     """
@@ -132,10 +143,11 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]
 
 @mcp.tool()
 @require_sync
-def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
+def get_direct_chat_by_contact(sender_phone_number: str, skip_sync_check: bool = False) -> Dict[str, Any]:
     """Get WhatsApp chat metadata by sender phone number.
     
     Args:
+        skip_sync_check: Skip the sync health check; stored data may be stale (default False).
         sender_phone_number: The phone number to search for
     """
     chat = whatsapp_get_direct_chat_by_contact(sender_phone_number)
@@ -143,10 +155,11 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
 
 @mcp.tool()
 @require_sync
-def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
+def get_contact_chats(jid: str, limit: int = 20, page: int = 0, skip_sync_check: bool = False) -> List[Dict[str, Any]]:
     """Get all WhatsApp chats involving the contact.
     
     Args:
+        skip_sync_check: Skip the sync health check; stored data may be stale (default False).
         jid: The contact's JID to search for
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
@@ -156,10 +169,11 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
 
 @mcp.tool()
 @require_sync
-def get_last_interaction(jid: str) -> str:
+def get_last_interaction(jid: str, skip_sync_check: bool = False) -> str:
     """Get most recent WhatsApp message involving the contact.
     
     Args:
+        skip_sync_check: Skip the sync health check; stored data may be stale (default False).
         jid: The JID of the contact to search for
     """
     message = whatsapp_get_last_interaction(jid)
@@ -170,11 +184,13 @@ def get_last_interaction(jid: str) -> str:
 def get_message_context(
     message_id: str,
     before: int = 5,
-    after: int = 5
+    after: int = 5,
+    skip_sync_check: bool = False
 ) -> Dict[str, Any]:
     """Get context around a specific WhatsApp message.
     
     Args:
+        skip_sync_check: Skip the sync health check; stored data may be stale (default False).
         message_id: The ID of the message to get context for
         before: Number of messages to include before the target message (default 5)
         after: Number of messages to include after the target message (default 5)
@@ -186,11 +202,13 @@ def get_message_context(
 @require_sync
 def send_message(
     recipient: str,
-    message: str
+    message: str,
+    skip_sync_check: bool = False
 ) -> Dict[str, Any]:
     """Send a WhatsApp message to a person or group. For group chats use the JID.
 
     Args:
+        skip_sync_check: Skip the sync health check; stored data may be stale (default False).
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         message: The message text to send
@@ -214,10 +232,11 @@ def send_message(
 
 @mcp.tool()
 @require_sync
-def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
+def send_file(recipient: str, media_path: str, skip_sync_check: bool = False) -> Dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
     
     Args:
+        skip_sync_check: Skip the sync health check; stored data may be stale (default False).
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         media_path: The absolute path to the media file to send (image, video, document)
@@ -235,10 +254,11 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
 
 @mcp.tool()
 @require_sync
-def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
+def send_audio_message(recipient: str, media_path: str, skip_sync_check: bool = False) -> Dict[str, Any]:
     """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
     
     Args:
+        skip_sync_check: Skip the sync health check; stored data may be stale (default False).
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
@@ -254,10 +274,11 @@ def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
 
 @mcp.tool()
 @require_sync
-def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
+def download_media(message_id: str, chat_jid: str, skip_sync_check: bool = False) -> Dict[str, Any]:
     """Download media from a WhatsApp message and get the local file path.
     
     Args:
+        skip_sync_check: Skip the sync health check; stored data may be stale (default False).
         message_id: The ID of the message containing the media
         chat_jid: The JID of the chat containing the message
     
