@@ -1,4 +1,6 @@
 from typing import List, Dict, Any, Optional
+from functools import wraps
+import requests
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
@@ -18,7 +20,26 @@ from whatsapp import (
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
 
+def require_sync(function):
+    """Prevent apparently current answers when the bridge reports a failure."""
+    @wraps(function)
+    def checked(*args, **kwargs):
+        try:
+            response = requests.get("http://localhost:8080/api/status", timeout=3)
+            response.raise_for_status()
+            status = response.json()
+            if not isinstance(status, dict) or not isinstance(status.get("healthy"), bool) or not isinstance(status.get("reasons"), list):
+                raise ValueError("invalid status response")
+        except (requests.RequestException, ValueError) as exc:
+            raise RuntimeError(f"WhatsApp sync status unavailable: {exc}. Start or update the bridge; local data may be stale.") from exc
+        if not status["healthy"]:
+            reasons = "; ".join(str(reason) for reason in status["reasons"]) or "Unknown sync failure"
+            raise RuntimeError(f"WhatsApp sync is not healthy: {reasons}. Local data may be stale; tell the user.")
+        return function(*args, **kwargs)
+    return checked
+
 @mcp.tool()
+@require_sync
 def search_contacts(query: str) -> List[Dict[str, Any]]:
     """Search WhatsApp contacts by name or phone number.
     
@@ -29,6 +50,7 @@ def search_contacts(query: str) -> List[Dict[str, Any]]:
     return contacts
 
 @mcp.tool()
+@require_sync
 def list_messages(
     after: Optional[str] = None,
     before: Optional[str] = None,
@@ -70,6 +92,7 @@ def list_messages(
     return messages
 
 @mcp.tool()
+@require_sync
 def list_chats(
     query: Optional[str] = None,
     limit: int = 20,
@@ -96,6 +119,7 @@ def list_chats(
     return chats
 
 @mcp.tool()
+@require_sync
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]:
     """Get WhatsApp chat metadata by JID.
     
@@ -107,6 +131,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]
     return chat
 
 @mcp.tool()
+@require_sync
 def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
     """Get WhatsApp chat metadata by sender phone number.
     
@@ -117,6 +142,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
     return chat
 
 @mcp.tool()
+@require_sync
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
     """Get all WhatsApp chats involving the contact.
     
@@ -129,6 +155,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
     return chats
 
 @mcp.tool()
+@require_sync
 def get_last_interaction(jid: str) -> str:
     """Get most recent WhatsApp message involving the contact.
     
@@ -139,6 +166,7 @@ def get_last_interaction(jid: str) -> str:
     return message
 
 @mcp.tool()
+@require_sync
 def get_message_context(
     message_id: str,
     before: int = 5,
@@ -155,6 +183,7 @@ def get_message_context(
     return context
 
 @mcp.tool()
+@require_sync
 def send_message(
     recipient: str,
     message: str
@@ -184,6 +213,7 @@ def send_message(
     }
 
 @mcp.tool()
+@require_sync
 def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
     
@@ -204,6 +234,7 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     }
 
 @mcp.tool()
+@require_sync
 def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
     
@@ -222,6 +253,7 @@ def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
     }
 
 @mcp.tool()
+@require_sync
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
     """Download media from a WhatsApp message and get the local file path.
     

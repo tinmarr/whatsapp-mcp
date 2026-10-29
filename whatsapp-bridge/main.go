@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -43,7 +44,55 @@ type Message struct {
 
 // Database handler for storing message history
 type MessageStore struct {
-	db *sql.DB
+	db     *sql.DB
+	status *syncStatus
+}
+
+type syncStatus struct {
+	mu         sync.RWMutex
+	connection string
+	failures   map[string]string
+}
+
+func newSyncStatus() *syncStatus {
+	return &syncStatus{connection: "Connecting to WhatsApp", failures: make(map[string]string)}
+}
+
+func (s *syncStatus) setConnection(reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.connection = reason
+}
+
+func (s *syncStatus) disconnected() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.connection == "" {
+		s.connection = "Disconnected from WhatsApp; messages may be stale"
+	}
+}
+
+func (s *syncStatus) setFailure(key, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if reason == "" {
+		delete(s.failures, key)
+	} else {
+		s.failures[key] = reason
+	}
+}
+
+func (s *syncStatus) reasons() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	reasons := make([]string, 0, len(s.failures)+1)
+	if s.connection != "" {
+		reasons = append(reasons, s.connection)
+	}
+	for _, reason := range s.failures {
+		reasons = append(reasons, reason)
+	}
+	return reasons
 }
 
 // Initialize message store
@@ -421,6 +470,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
 	if err != nil {
 		logger.Warnf("Failed to store chat: %v", err)
+		messageStore.status.setFailure("storage", fmt.Sprintf("Failed to store a chat: %v", err))
 	}
 
 	// Extract text content
@@ -453,6 +503,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	if err != nil {
 		logger.Warnf("Failed to store message: %v", err)
+		messageStore.status.setFailure("storage", fmt.Sprintf("Failed to store a message: %v", err))
 	} else {
 		// Log message reception
 		timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
@@ -677,6 +728,15 @@ func extractDirectPathFromURL(url string) string {
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	http.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		reasons := messageStore.status.reasons()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"healthy": len(reasons) == 0, "reasons": reasons})
+	})
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -833,6 +893,8 @@ func main() {
 		return
 	}
 	defer messageStore.Close()
+	messageStore.status = newSyncStatus()
+	startRESTServer(client, messageStore, 8080)
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
@@ -847,52 +909,79 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			messageStore.status.setConnection("")
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+			messageStore.status.setConnection("WhatsApp device logged out; scan a new QR code to reconnect")
+		case *events.Disconnected:
+			messageStore.status.disconnected()
+		case *events.ConnectFailure:
+			messageStore.status.setConnection(fmt.Sprintf("WhatsApp connection failed: %s %s", v.Reason, v.Message))
+		case *events.ClientOutdated:
+			messageStore.status.setConnection("WhatsApp rejected the client version as outdated")
+		case *events.StreamReplaced:
+			messageStore.status.setConnection("WhatsApp connection was replaced by another client using this session")
+		case *events.AppStateSyncError:
+			messageStore.status.setFailure("appstate:"+string(v.Name), fmt.Sprintf("WhatsApp app-state sync failed for %s: %v", v.Name, v.Error))
+		case *events.AppStateSyncComplete:
+			messageStore.status.setFailure("appstate:"+string(v.Name), "")
 		}
 	})
 
-	// Create channel to track connection success
-	connected := make(chan bool, 1)
-
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
+		messageStore.status.setConnection("Waiting for WhatsApp QR code scan")
 		// No ID stored, this is a new client, need to pair with phone
-		qrChan, _ := client.GetQRChannel(context.Background())
+		qrChan, err := client.GetQRChannel(context.Background())
+		if err != nil {
+			messageStore.status.setConnection(fmt.Sprintf("Could not start WhatsApp pairing: %v", err))
+			waitForShutdown(client)
+			return
+		}
 		err = client.Connect()
 		if err != nil {
+			messageStore.status.setConnection(fmt.Sprintf("WhatsApp connection failed: %v", err))
 			logger.Errorf("Failed to connect: %v", err)
+			waitForShutdown(client)
 			return
 		}
 
 		// Print QR code for pairing with phone
+		paired := false
+		pairingFailure := "WhatsApp pairing ended before the QR code was scanned"
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 			} else if evt.Event == "success" {
-				connected <- true
+				paired = true
 				break
+			} else if evt.Event != "" {
+				pairingFailure = fmt.Sprintf("WhatsApp pairing failed: %s", evt.Event)
+				if evt.Error != nil {
+					pairingFailure += ": " + evt.Error.Error()
+				}
+				messageStore.status.setConnection(pairingFailure)
 			}
 		}
 
-		// Wait for connection
-		select {
-		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
+		if !paired {
+			messageStore.status.setConnection(pairingFailure)
+			logger.Errorf("WhatsApp pairing did not complete")
+			waitForShutdown(client)
 			return
 		}
+		fmt.Println("\nSuccessfully connected and authenticated!")
 	} else {
 		// Already logged in, just connect
 		err = client.Connect()
 		if err != nil {
+			messageStore.status.setConnection(fmt.Sprintf("WhatsApp connection failed: %v", err))
 			logger.Errorf("Failed to connect: %v", err)
+			waitForShutdown(client)
 			return
 		}
-		connected <- true
 	}
 
 	// Wait a moment for connection to stabilize
@@ -900,15 +989,16 @@ func main() {
 
 	if !client.IsConnected() {
 		logger.Errorf("Failed to establish stable connection")
-		return
+		messageStore.status.setConnection("Failed to establish a stable WhatsApp connection")
+	} else {
+		fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 	}
 
-	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+	waitForShutdown(client)
+}
 
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
-
-	// Create a channel to keep the main goroutine alive
+func waitForShutdown(client *whatsmeow.Client) {
+	// Keep the status endpoint available until the service stops.
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
 
@@ -1045,7 +1135,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				continue
 			}
 
-			messageStore.StoreChat(chatJID, name, timestamp)
+			if err := messageStore.StoreChat(chatJID, name, timestamp); err != nil {
+				messageStore.status.setFailure("storage", fmt.Sprintf("Failed to store history chat: %v", err))
+			}
 
 			// Store messages
 			for _, msg := range messages {
@@ -1129,6 +1221,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
+					messageStore.status.setFailure("storage", fmt.Sprintf("Failed to store history message: %v", err))
 				} else {
 					syncedCount++
 					// Log successful message storage
