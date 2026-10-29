@@ -8,7 +8,27 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+SESSION_DB_PATH = os.path.join(os.path.dirname(MESSAGES_DB_PATH), 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+
+def chat_addresses(jid: str) -> list[str]:
+    """Return known phone and linked-device addresses for a direct chat."""
+    addresses = [jid]
+    user, separator, server = jid.partition('@')
+    if not separator or server not in ('lid', 's.whatsapp.net'):
+        return addresses
+    if not os.path.exists(SESSION_DB_PATH):
+        return addresses
+    with sqlite3.connect(f"file:{SESSION_DB_PATH}?mode=ro", uri=True) as conn:
+        if server == 'lid':
+            row = conn.execute('SELECT pn FROM whatsmeow_lid_map WHERE lid = ?', (user,)).fetchone()
+            other_server = 's.whatsapp.net'
+        else:
+            row = conn.execute('SELECT lid FROM whatsmeow_lid_map WHERE pn = ?', (user,)).fetchone()
+            other_server = 'lid'
+        if row:
+            addresses.append(f'{row[0]}@{other_server}')
+    return addresses
 
 @dataclass
 class Message:
@@ -168,8 +188,9 @@ def list_messages(
             params.append(sender_phone_number)
             
         if chat_jid:
-            where_clauses.append("messages.chat_jid = ?")
-            params.append(chat_jid)
+            addresses = chat_addresses(chat_jid)
+            where_clauses.append("messages.chat_jid IN (" + ','.join('?' for _ in addresses) + ")")
+            params.extend(addresses)
             
         if query:
             where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
@@ -334,9 +355,7 @@ def list_chats(
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
-                messages.content as last_message,
-                messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
+                """ + ("messages.content, messages.sender, messages.is_from_me" if include_last_message else "NULL, NULL, NULL") + """
             FROM chats
         """]
         
@@ -421,8 +440,27 @@ def search_contacts(query: str) -> List[Contact]:
                 jid=contact_data[0]
             )
             result.append(contact)
+
+        # The session store contains address-book names that aren't in the
+        # message history, including contacts addressed by linked IDs.
+        if os.path.exists(SESSION_DB_PATH):
+            with sqlite3.connect(f"file:{SESSION_DB_PATH}?mode=ro", uri=True) as session:
+                rows = session.execute("""
+                    SELECT their_jid, COALESCE(NULLIF(full_name, ''), NULLIF(first_name, ''),
+                                               NULLIF(push_name, ''), NULLIF(business_name, ''))
+                    FROM whatsmeow_contacts
+                    WHERE their_jid NOT LIKE '%@g.us' AND
+                          (their_jid LIKE ? OR full_name LIKE ? OR first_name LIKE ?
+                           OR push_name LIKE ? OR business_name LIKE ?)
+                    LIMIT 50
+                """, (search_pattern,) * 5).fetchall()
+            seen = {contact.jid for contact in result}
+            for jid, name in rows:
+                if jid not in seen:
+                    result.append(Contact(phone_number=jid.split('@')[0], name=name, jid=jid))
+                    seen.add(jid)
             
-        return result
+        return result[:50]
         
     except sqlite3.Error as e:
         print(f"Database error: {e}")
@@ -543,9 +581,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
                 c.jid,
                 c.name,
                 c.last_message_time,
-                m.content as last_message,
-                m.sender as last_sender,
-                m.is_from_me as last_is_from_me
+                """ + ("m.content, m.sender, m.is_from_me" if include_last_message else "NULL, NULL, NULL") + """
             FROM chats c
         """
         
@@ -585,6 +621,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
+        addresses = chat_addresses(sender_phone_number if '@' in sender_phone_number else sender_phone_number + '@s.whatsapp.net')
         
         cursor.execute("""
             SELECT 
@@ -597,9 +634,10 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
             FROM chats c
             LEFT JOIN messages m ON c.jid = m.chat_jid 
                 AND c.last_message_time = m.timestamp
-            WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+            WHERE c.jid IN ({})
+            ORDER BY c.last_message_time DESC
             LIMIT 1
-        """, (f"%{sender_phone_number}%",))
+        """.format(','.join('?' for _ in addresses)), addresses)
         
         chat_data = cursor.fetchone()
         

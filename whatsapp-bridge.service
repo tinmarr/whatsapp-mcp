@@ -1,0 +1,13 @@
+[Unit]
+Description=WhatsApp bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/home/martin/coding/whatsapp-mcp/whatsapp-bridge
+ExecStart=/usr/bin/go run main.go
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
